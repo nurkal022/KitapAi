@@ -1,0 +1,34 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.~
+
+# Environment variables
+.env
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Database files
+mindmap.db
+*.sqlite3
+
+# User-generated content
+books/
+mindmaps/
+data.md
+дата.md
+
+# Streamlit
+.streamlit/
+
+# Build artifacts
+mindmap_app
+
+# OS-specific files
+.DS_Store
+Thumbs.db 

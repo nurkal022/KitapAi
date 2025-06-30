@@ -1,0 +1,7 @@
+streamlit
+streamlit-markmap
+PyMuPDF
+openai
+tiktoken
+tenacity
+python-dotenv 
