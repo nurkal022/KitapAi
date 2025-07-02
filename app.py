@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit_markmap as markmap
+import streamlit.components.v1 as stc
 from pdf_mindmap_generator import PDFChapterExtractor
 from mindmap_generator import MindMapGenerator, process_chapters_to_mindmaps
 import tempfile
@@ -220,6 +221,7 @@ class MindMapApp:
                 /* Убираем оранжевую обводку у текстовых полей */
                 .stTextInput > div > div > input {
                     border-color: #ddd;
+                    color: #000;
                 }
                 .stTextInput > div > div > input:focus {
                     box-shadow: none;
@@ -413,9 +415,10 @@ class MindMapApp:
 
                 with col5:
                     # Кнопка экспорта в HTML
+                    content_str = mindmap['content'] if mindmap['content'] is not None else ""
                     html_content = self.html_exporter.markdown_to_html(
                         title=mindmap['name'],
-                        content=mindmap['content']
+                        content=content_str
                     )
                     st.download_button(
                         label="🌐 HTML",
@@ -864,7 +867,53 @@ class MindMapApp:
                 with col2:
                     st.subheader("Preview")
                     cleaned_content = self.clean_mindmap_content(st.session_state.current_content)
-                    markmap.markmap(cleaned_content)
+
+                    # Render Markmap and PNG export button together in a single HTML block
+                    import json as _json
+                    content_str = st.session_state.current_content if st.session_state.current_content is not None else ""
+                    markmap_data = _json.dumps({
+                        "content": "Mindmap",
+                        "children": HTMLExporter().parse_markdown_to_json(content_str)
+                    })
+                    stc.html(f'''
+                        <div id="markmap-container" style="background:white;border-radius:16px;padding:16px;">
+                            <button id="export-png-btn" style="margin-bottom:10px;padding:8px 16px;background:#004be0;color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem;">🖼️ Export as PNG</button>
+                            <svg id="mindmap-svg" width="900" height="600"></svg>
+                        </div>
+                        <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+                        <script src="https://cdn.jsdelivr.net/npm/markmap-view@0.17.3-alpha.8/dist/browser/index.js"></script>
+                        <script>
+                        const data = {markmap_data};
+                        const svg = document.getElementById('mindmap-svg');
+                        window.mm = window.markmap.Markmap.create(svg, null, data);
+                        window.mm.fit();
+                        function downloadSVGAsPNG(svgId, filename) {{
+                            var svg = document.getElementById(svgId);
+                            var serializer = new XMLSerializer();
+                            var svgString = serializer.serializeToString(svg);
+                            var canvas = document.createElement('canvas');
+                            var bbox = svg.getBBox();
+                            canvas.width = bbox.width + bbox.x;
+                            canvas.height = bbox.height + bbox.y;
+                            var ctx = canvas.getContext('2d');
+                            var img = new window.Image();
+                            img.onload = function() {{
+                                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                                ctx.drawImage(img, 0, 0);
+                                var a = document.createElement('a');
+                                a.download = filename;
+                                a.href = canvas.toDataURL('image/png');
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                            }};
+                            img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgString)));
+                        }}
+                        document.getElementById('export-png-btn').onclick = function() {{
+                            downloadSVGAsPNG('mindmap-svg', 'mindmap.png');
+                        }};
+                        </script>
+                    ''', height=650)
 
         with st.expander("ℹ️ Tips for editing"):
             st.markdown("""

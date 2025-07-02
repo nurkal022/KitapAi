@@ -4,4 +4,5 @@ PyMuPDF
 openai
 tiktoken
 tenacity
-python-dotenv 
+python-dotenv
+SQLAlchemy
