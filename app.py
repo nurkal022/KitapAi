@@ -878,6 +878,7 @@ class MindMapApp:
                     stc.html(f'''
                         <div id="markmap-container" style="background:white;border-radius:16px;padding:16px;">
                             <button id="export-png-btn" style="margin-bottom:10px;padding:8px 16px;background:#004be0;color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem;">🖼️ Export as PNG</button>
+                            <button id="export-svg-btn" style="margin-bottom:10px;margin-left:10px;padding:8px 16px;background:#198754;color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem;">🗺️ Export as SVG</button>
                             <svg id="mindmap-svg" width="900" height="600"></svg>
                         </div>
                         <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
@@ -909,8 +910,23 @@ class MindMapApp:
                             }};
                             img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgString)));
                         }}
+                        function downloadSVG(svgId, filename) {{
+                            var svg = document.getElementById(svgId);
+                            var serializer = new XMLSerializer();
+                            var svgString = serializer.serializeToString(svg);
+                            var blob = new Blob([svgString], {{type: 'image/svg+xml'}});
+                            var a = document.createElement('a');
+                            a.download = filename;
+                            a.href = URL.createObjectURL(blob);
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                        }}
                         document.getElementById('export-png-btn').onclick = function() {{
                             downloadSVGAsPNG('mindmap-svg', 'mindmap.png');
+                        }};
+                        document.getElementById('export-svg-btn').onclick = function() {{
+                            downloadSVG('mindmap-svg', 'mindmap.svg');
                         }};
                         </script>
                     ''', height=650)
