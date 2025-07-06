@@ -1,7 +1,7 @@
-from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime, inspect
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime, inspect, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, scoped_session
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 import os
 from typing import Generator
@@ -27,10 +27,66 @@ class User(Base):
     password = Column(String(256), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     
+    # Subscription fields
+    is_subscribed = Column(Boolean, default=False)
+    stripe_customer_id = Column(String(100), nullable=True)
+    trial_start_date = Column(DateTime, nullable=True)
+    trial_end_date = Column(DateTime, nullable=True)
+    subscription_end_date = Column(DateTime, nullable=True)
+    
     mindmaps = relationship("MindMap", back_populates="user", cascade="all, delete-orphan")
+    subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<User {self.username}>"
+    
+    def is_trial_active(self) -> bool:
+        """Check if user's trial is still active"""
+        if self.trial_end_date is None:
+            return False
+        return datetime.utcnow() < self.trial_end_date
+    
+    def is_subscription_active(self) -> bool:
+        """Check if user has active subscription"""
+        if self.is_subscribed and self.subscription_end_date is not None:
+            return datetime.utcnow() < self.subscription_end_date
+        return False
+    
+    def can_access_service(self) -> bool:
+        """Check if user can access the service (paid subscription only)"""
+        return bool(self.is_subscription_active())
+
+class Subscription(Base):
+    __tablename__ = 'subscriptions'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    stripe_subscription_id = Column(String(100), nullable=True)
+    stripe_price_id = Column(String(100), nullable=True)
+    status = Column(String(20), default='active')  # active, canceled, past_due
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = relationship("User", back_populates="subscriptions")
+    
+    def __repr__(self):
+        return f"<Subscription {self.id} for user {self.user_id}>"
+
+class PaymentHistory(Base):
+    __tablename__ = 'payment_history'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True)
+    stripe_payment_intent_id = Column(String(100), nullable=True)
+    amount = Column(Integer, nullable=True)  # Amount in cents
+    currency = Column(String(3), default='usd')
+    status = Column(String(20), default='pending')  # succeeded, failed, pending
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<PaymentHistory {self.id} for user {self.user_id}>"
 
 class MindMap(Base):
     __tablename__ = 'mindmaps'
@@ -195,3 +251,156 @@ def update_mindmap(mindmap_id: int, name: str, content: str) -> dict:
             db.flush()  # Обновляем объект в сессии
             return mindmap.to_dict()
         return None
+
+# Subscription and Payment Functions
+def start_user_trial(user_id: int) -> bool:
+    """Start 14-day trial for user"""
+    with db_manager.get_db() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and not user.trial_start_date:
+            user.trial_start_date = datetime.utcnow()
+            user.trial_end_date = datetime.utcnow() + timedelta(days=14)
+            return True
+        return False
+
+def get_user_subscription_status(user_id: int) -> dict | None:
+    """Get user's subscription and trial status"""
+    with db_manager.get_db() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            return {
+                'user_id': user.id,
+                'is_subscribed': user.is_subscribed,
+                'trial_start_date': user.trial_start_date.isoformat() if user.trial_start_date else None,
+                'trial_end_date': user.trial_end_date.isoformat() if user.trial_end_date else None,
+                'subscription_end_date': user.subscription_end_date.isoformat() if user.subscription_end_date else None,
+                'can_access_service': user.can_access_service(),
+                'is_trial_active': user.is_trial_active(),
+                'is_subscription_active': user.is_subscription_active(),
+                'stripe_customer_id': user.stripe_customer_id
+            }
+        return None
+
+def update_user_stripe_customer(user_id: int, stripe_customer_id: str) -> bool:
+    """Update user's Stripe customer ID"""
+    with db_manager.get_db() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            user.stripe_customer_id = stripe_customer_id
+            return True
+        return False
+
+def create_subscription(user_id: int, stripe_subscription_id: str, stripe_price_id: str, 
+                       current_period_start: datetime, current_period_end: datetime, 
+                       status: str = 'active') -> dict | None:
+    """Create a new subscription record"""
+    with db_manager.get_db() as db:
+        subscription = Subscription(
+            user_id=user_id,
+            stripe_subscription_id=stripe_subscription_id,
+            stripe_price_id=stripe_price_id,
+            current_period_start=current_period_start,
+            current_period_end=current_period_end,
+            status=status
+        )
+        db.add(subscription)
+        
+        # Update user subscription status - treat both 'active' and 'trialing' as active
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            user.is_subscribed = True
+            user.subscription_end_date = current_period_end
+        
+        db.flush()
+        return {
+            'id': subscription.id,
+            'user_id': subscription.user_id,
+            'stripe_subscription_id': subscription.stripe_subscription_id,
+            'status': subscription.status
+        }
+
+def update_subscription_status(stripe_subscription_id: str, status: str, 
+                             current_period_end: datetime = None) -> bool:
+    """Update subscription status"""
+    with db_manager.get_db() as db:
+        subscription = db.query(Subscription).filter(
+            Subscription.stripe_subscription_id == stripe_subscription_id
+        ).first()
+        if subscription:
+            subscription.status = status
+            if current_period_end:
+                subscription.current_period_end = current_period_end
+            
+            # Update user subscription status - treat both 'active' and 'trialing' as active
+            user = db.query(User).filter(User.id == subscription.user_id).first()
+            if user:
+                if status in ['active', 'trialing']:
+                    user.is_subscribed = True
+                    user.subscription_end_date = current_period_end
+                elif status in ['canceled', 'past_due']:
+                    user.is_subscribed = False
+                    user.subscription_end_date = current_period_end
+            
+            return True
+        return False
+
+def create_payment_record(user_id: int, stripe_payment_intent_id: str, 
+                         amount: int, currency: str = 'usd', status: str = 'pending') -> dict:
+    """Create a payment history record"""
+    with db_manager.get_db() as db:
+        payment = PaymentHistory(
+            user_id=user_id,
+            stripe_payment_intent_id=stripe_payment_intent_id,
+            amount=amount,
+            currency=currency,
+            status=status
+        )
+        db.add(payment)
+        db.flush()
+        return {
+            'id': payment.id,
+            'user_id': payment.user_id,
+            'amount': payment.amount,
+            'status': payment.status,
+            'created_at': payment.created_at.isoformat()
+        }
+
+def update_payment_status(stripe_payment_intent_id: str, status: str) -> bool:
+    """Update payment status"""
+    with db_manager.get_db() as db:
+        payment = db.query(PaymentHistory).filter(
+            PaymentHistory.stripe_payment_intent_id == stripe_payment_intent_id
+        ).first()
+        if payment:
+            payment.status = status
+            return True
+        return False
+
+def get_user_payment_history(user_id: int) -> list:
+    """Get user's payment history"""
+    with db_manager.get_db() as db:
+        payments = db.query(PaymentHistory).filter(
+            PaymentHistory.user_id == user_id
+        ).order_by(PaymentHistory.created_at.desc()).all()
+        return [{
+            'id': payment.id,
+            'amount': payment.amount,
+            'currency': payment.currency,
+            'status': payment.status,
+            'created_at': payment.created_at.isoformat()
+        } for payment in payments]
+
+def get_user_subscriptions(user_id: int) -> list:
+    """Get user's subscription records"""
+    with db_manager.get_db() as db:
+        subscriptions = db.query(Subscription).filter(
+            Subscription.user_id == user_id
+        ).order_by(Subscription.created_at.desc()).all()
+        return [{
+            'id': subscription.id,
+            'stripe_subscription_id': subscription.stripe_subscription_id,
+            'status': subscription.status,
+            'current_period_start': subscription.current_period_start.isoformat() if subscription.current_period_start else None,
+            'current_period_end': subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+            'created_at': subscription.created_at.isoformat()
+        } for subscription in subscriptions]

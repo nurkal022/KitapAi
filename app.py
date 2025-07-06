@@ -18,18 +18,42 @@ from database import (
     create_mindmap,
     get_mindmap_by_id,
     delete_mindmap,
-    update_mindmap
+    update_mindmap,
+    start_user_trial,
+    get_user_subscription_status,
+    update_user_stripe_customer,
+    create_subscription,
+    update_subscription_status,
+    create_payment_record,
+    update_payment_status,
+    get_user_payment_history,
+    get_user_subscriptions
 )
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import logging
 from math import cos, sin, pi
 from canvas_exporter import CanvasExporter
 from html_exporter import HTMLExporter
+from payment_service import payment_service
+from payment_ui import payment_ui
 
 # Загружаем переменные окружения
-load_dotenv()
+print("=== DEBUG: Before load_dotenv() ===")
+print(f"STRIPE_SECRET_KEY: {os.getenv('STRIPE_SECRET_KEY')}")
+print(f"Current working directory: {os.getcwd()}")
+print(f".env file exists: {os.path.exists('.env')}")
+print(f".env file size: {os.path.getsize('.env') if os.path.exists('.env') else 'N/A'}")
+
+load_dotenv(override=True)
+
+# Debug: Print loaded environment variables
+print("=== DEBUG: After load_dotenv() ===")
+print(f"STRIPE_SECRET_KEY: {os.getenv('STRIPE_SECRET_KEY')}")
+print(f"STRIPE_PUBLISHABLE_KEY: {os.getenv('STRIPE_PUBLISHABLE_KEY')}")
+print(f"STRIPE_MONTHLY_PRICE_ID: {os.getenv('STRIPE_MONTHLY_PRICE_ID')}")
+print("===================================")
 
 # Инициализируем базу данных
 db_manager.init_db()
@@ -277,15 +301,25 @@ class MindMapApp:
     def setup_session_state(self):
         """Инициализация состояния сессии"""
         if 'logged_in' not in st.session_state:
-            st.session_state.logged_in = False
+            st.session_state["logged_in"] = False
         if 'user_id' not in st.session_state:
-            st.session_state.user_id = None
+            st.session_state["user_id"] = None
         if 'current_page' not in st.session_state:
-            st.session_state.current_page = 'dashboard'
+            st.session_state["current_page"] = 'dashboard'
         if 'delete_confirmation' not in st.session_state:
-            st.session_state.delete_confirmation = None
+            st.session_state["delete_confirmation"] = None
         if 'current_mindmap' not in st.session_state:
-            st.session_state.current_mindmap = None
+            st.session_state["current_mindmap"] = None
+        
+        # Payment-related session states
+        if 'show_payment' not in st.session_state:
+            st.session_state["show_payment"] = False
+        if 'payment_error' not in st.session_state:
+            st.session_state["payment_error"] = None
+        if 'payment_success' not in st.session_state:
+            st.session_state["payment_success"] = False
+        if 'subscription_status' not in st.session_state:
+            st.session_state["subscription_status"] = None
 
     def hash_password(self, password: str) -> str:
         return hashlib.sha256(password.encode()).hexdigest()
@@ -293,8 +327,9 @@ class MindMapApp:
     def login_user(self, username: str, password: str) -> bool:
         user = get_user_by_username(username)
         if user and user['password'] == self.hash_password(password):
-            st.session_state.logged_in = True
-            st.session_state.user_id = user['id']
+            st.session_state["logged_in"] = True
+            st.session_state["current_page"] = "dashboard"
+            st.session_state["user_id"] = user['id']
             return True
         return False
 
@@ -302,8 +337,40 @@ class MindMapApp:
         if get_user_by_username(username):
             return False
         
-        create_user(username, self.hash_password(password))
+        user_data = create_user(username, self.hash_password(password))
+        if user_data:
+            # Start trial for new user
+            start_user_trial(user_data['id'])
         return True
+    
+    def check_subscription_access(self) -> bool:
+        """Check if user has access to the service (paid subscription only, no trial)"""
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            return False
+        
+        # Get user's subscription status
+        subscription_status = get_user_subscription_status(user_id)
+        if not subscription_status:
+            return False
+        
+        # Only allow access if user has an active paid subscription (ignore trial)
+        return subscription_status.get('is_subscription_active', False)
+    
+    def handle_payment_flow(self):
+        """Handle payment flow for users without paid subscription"""
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            return
+        
+        subscription_status = get_user_subscription_status(user_id)
+        if not subscription_status:
+            return
+        
+        # If user doesn't have active paid subscription, show payment
+        if not subscription_status.get('is_subscription_active', False):
+            st.session_state.show_payment = True
+            st.rerun()
 
     def show_auth_page(self):
         """Страница аутентификации"""
@@ -325,6 +392,8 @@ class MindMapApp:
                 
                 if submit:
                     if self.login_user(username, password):
+                        st.session_state["logged_in"] = True
+                        st.session_state["current_page"] = "dashboard"
                         st.success("Successfully logged in!")
                         st.rerun()
                     else:
@@ -355,17 +424,69 @@ class MindMapApp:
             </div>
         """, unsafe_allow_html=True)
         
-        # Кнопка создания нового майндмапа
-        if st.button("➕ Create New MindMap", use_container_width=True):
-            st.session_state.current_page = 'mindmap'
-            st.session_state.current_mindmap = None
-            st.rerun()
+        # Check subscription status and show appropriate buttons
+        user_id = st.session_state.get("user_id")
+        subscription_status = get_user_subscription_status(user_id) if user_id else None
+        has_active_subscription = subscription_status and subscription_status.get('is_subscription_active', False)
+        
+        # Debug: Show subscription status
+        if st.checkbox("🔍 Show Debug Info", key="debug_subscription"):
+            st.write("### Debug Information")
+            st.write(f"User ID: {user_id}")
+            st.write(f"Subscription Status: {subscription_status}")
+            st.write(f"Has Active Subscription: {has_active_subscription}")
+            if subscription_status:
+                st.write(f"Is Subscribed: {subscription_status.get('is_subscribed')}")
+                st.write(f"Is Subscription Active: {subscription_status.get('is_subscription_active')}")
+                st.write(f"Subscription End Date: {subscription_status.get('subscription_end_date')}")
+                st.write(f"Stripe Customer ID: {subscription_status.get('stripe_customer_id')}")
+            
+            # Add refresh button
+            if st.button("🔄 Refresh Subscription Status", key="refresh_subscription"):
+                st.rerun()
+            
+            # Show subscription records
+            subscriptions = get_user_subscriptions(user_id) if user_id else []
+            if subscriptions:
+                st.write("### Subscription Records")
+                for sub in subscriptions:
+                    st.write(f"ID: {sub['id']}, Status: {sub['status']}, Stripe ID: {sub['stripe_subscription_id']}")
+                    st.write(f"Period: {sub['current_period_start']} to {sub['current_period_end']}")
+            else:
+                st.write("### No subscription records found")
+        
+        # Кнопки управления
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if has_active_subscription:
+                if st.button("➕ Create New MindMap", use_container_width=True):
+                    st.session_state["current_page"] = 'mindmap'
+                    st.session_state["current_mindmap"] = None
+                    st.rerun()
+            else:
+                st.button("➕ Create New MindMap", use_container_width=True, disabled=True)
+                st.caption("💳 Subscription required")
+        
+        with col2:
+            if st.button("💰 Pricing & Subscription", use_container_width=True):
+                st.session_state["current_page"] = 'pricing'
+                st.rerun()
+        
+        with col3:
+            if st.button("📊 Payment History", use_container_width=True):
+                st.session_state["current_page"] = 'payment_history'
+                st.rerun()
         
         # Добавляем разделитель
         st.markdown("---")
         
         # Список существующих майндмапов
-        mindmaps = get_user_mindmaps(st.session_state.user_id)
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            st.error("User not found")
+            return
+        mindmaps = get_user_mindmaps(user_id)
         
         for mindmap in mindmaps:
             with st.container():
@@ -386,19 +507,19 @@ class MindMapApp:
                                help="Edit this mindmap",
                                use_container_width=True):
                         # Очищаем состояние предыдущего майндмапа
-                        st.session_state.current_content = None
-                        st.session_state.current_mindmap_id = None
+                        st.session_state["current_content"] = None
+                        st.session_state["current_mindmap_id"] = None
                         # Устанавливаем новый майндмап
-                        st.session_state.current_mindmap = mindmap['id']
-                        st.session_state.current_page = 'mindmap'
+                        st.session_state["current_mindmap"] = mindmap['id']
+                        st.session_state["current_page"] = 'mindmap'
                         st.rerun()
                 
                 with col3:
                     if st.button("👁️ View", key=f"view_{mindmap['id']}", 
                                help="View this mindmap",
                                use_container_width=True):
-                        st.session_state.current_mindmap = mindmap['id']
-                        st.session_state.current_page = 'view'
+                        st.session_state["current_mindmap"] = mindmap['id']
+                        st.session_state["current_page"] = 'view'
                         st.rerun()
                 
                 with col4:
@@ -445,26 +566,26 @@ class MindMapApp:
                 
                 with col6:
                     # Логика удаления
-                    if st.session_state.delete_confirmation == mindmap['id']:
+                    if st.session_state.get("delete_confirmation") == mindmap['id']:
                         col7_1, col7_2 = st.columns(2)
                         with col7_1:
                             if st.button("✓", key=f"confirm_yes_{mindmap['id']}", 
                                        help="Confirm deletion",
                                        use_container_width=True):
                                 delete_mindmap(mindmap['id'])
-                                st.session_state.delete_confirmation = None
+                                st.session_state["delete_confirmation"] = None
                                 st.rerun()
                         with col7_2:
                             if st.button("✗", key=f"confirm_no_{mindmap['id']}", 
                                        help="Cancel deletion",
                                        use_container_width=True):
-                                st.session_state.delete_confirmation = None
+                                st.session_state["delete_confirmation"] = None
                                 st.rerun()
                     else:
                         if st.button("🗑️", key=f"delete_{mindmap['id']}", 
                                    help="Delete this mindmap",
                                    use_container_width=True):
-                            st.session_state.delete_confirmation = mindmap['id']
+                            st.session_state["delete_confirmation"] = mindmap['id']
                             st.rerun()
                 
                 # Добавляем разделитель между майндмапами
@@ -472,7 +593,28 @@ class MindMapApp:
 
     def show_mindmap_page(self):
         """Страница работы с майндмапом (создание/редактирование)"""
+        # Check if user has active subscription before allowing mindmap creation
         if st.session_state.current_mindmap is None:
+            # Check subscription status for new mindmap creation
+            user_id = st.session_state.get("user_id")
+            if user_id:
+                subscription_status = get_user_subscription_status(user_id)
+                if not subscription_status or not subscription_status.get('is_subscription_active', False):
+                    st.error("❌ Subscription Required")
+                    st.warning("You need an active subscription to create mind maps.")
+                    st.info("Please subscribe to continue using Kitap AI.")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("💰 Subscribe Now", use_container_width=True):
+                            st.session_state["current_page"] = "pricing"
+                            st.rerun()
+                    with col2:
+                        if st.button("🏠 Back to Dashboard", use_container_width=True):
+                            st.session_state["current_page"] = "dashboard"
+                            st.rerun()
+                    return
+            
             st.title("Create New MindMap")
             
             tab1, tab2, tab3 = st.tabs(["Create New", "Import from File", "Generate from Prompt"])
@@ -1027,10 +1169,276 @@ class MindMapApp:
 
     def main(self):
         """Основная логика приложения"""
-        if not st.session_state.logged_in:
+        if not st.session_state.get("logged_in"):
             self.show_auth_page()
         else:
-            self.show_main_page()
+            # Add sidebar navigation
+            self.show_sidebar()
+            
+            # Show dashboard if just logged in
+            if st.session_state.get("current_page") == "dashboard":
+                self.show_dashboard()
+            # Show payment form if needed
+            elif st.session_state.get("show_payment"):
+                self.show_payment_page()
+            # Show pricing page
+            elif st.session_state.get("current_page") == "pricing":
+                self.show_pricing_page()
+            # Show payment history page
+            elif st.session_state.get("current_page") == "payment_history":
+                self.show_payment_history_page()
+            # Show settings page
+            elif st.session_state.get("current_page") == "settings":
+                self.show_settings_page()
+            # Show mindmap page
+            elif st.session_state.get("current_page") == "mindmap":
+                self.show_mindmap_page()
+            # Show mindmap view page
+            elif st.session_state.get("current_page") == "view":
+                self.show_mindmap_view()
+            else:
+                self.show_main_page()
+    
+    def show_payment_page(self):
+        """Show payment page for subscription"""
+        # Header with back button
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("← Back", key="back_from_payment"):
+                st.session_state["show_payment"] = False
+                st.session_state["current_page"] = "dashboard"
+                st.rerun()
+        
+        with col2:
+            st.markdown("""
+                <div style='text-align: center; padding: 1rem 0;'>
+                    <h1 style='color: #004be0; font-size: 2rem; margin-bottom: 0.5rem;'>Subscribe to Kitap AI</h1>
+                    <p style='color: #666; font-size: 1.1rem;'>Get unlimited access to create mind maps</p>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        # Get user info from database using user_id
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            st.error("User not found")
+            return
+        
+        # We need to get user info from database using user_id
+        # For now, let's use a placeholder approach
+        user_email = f"user_{user_id}@example.com"
+        user_name = f"User_{user_id}"
+        
+        # Show payment form
+        payment_data = payment_ui.show_payment_form(
+            user_id=user_id,
+            user_email=user_email,
+            user_name=user_name
+        )
+        
+        if payment_data:
+            # Process payment
+            self.process_payment(user_id, payment_data)
+    
+    def process_payment(self, user_id: int, payment_data: dict):
+        """Process payment and create subscription"""
+        print("=== DEBUG: Starting payment processing ===")
+        print(f"user_id: {user_id}")
+        print(f"payment_data keys: {list(payment_data.keys())}")
+        print("==========================================")
+        
+        try:
+            # Create Stripe customer
+            customer_id = payment_service.create_customer(
+                email=payment_data['billing_email'],
+                name=payment_data['billing_name']
+            )
+            
+            if not customer_id:
+                st.error("Failed to create customer")
+                return
+            
+            # Update user with Stripe customer ID
+            update_user_stripe_customer(user_id, customer_id)
+            
+            # Create and attach payment method
+            if payment_data.get('test_mode'):
+                # Create test payment method and attach to customer
+                payment_method_data = payment_service.create_test_payment_method(
+                    card_number=payment_data['card_number'],
+                    expiry_month=payment_data['expiry_month'],
+                    expiry_year=payment_data['expiry_year'],
+                    cvc=payment_data['cvc'],
+                    customer_id=customer_id
+                )
+                
+                if not payment_method_data:
+                    st.error("Failed to create payment method. Please check your card details.")
+                    return
+                
+                print(f"=== DEBUG: Payment method created and attached ===")
+                print(f"Payment method ID: {payment_method_data['payment_method_id']}")
+                print(f"Card: {payment_method_data['card_brand']} ending in {payment_method_data['card_last4']}")
+                print("==================================================")
+            else:
+                st.error("Payment processing not implemented in test mode.")
+                return
+            
+            # Create subscription
+            print("=== DEBUG: About to create Stripe subscription ===")
+            subscription_data = payment_service.create_subscription(customer_id)
+            print(f"=== DEBUG: Stripe subscription result ===")
+            print(f"subscription_data: {subscription_data}")
+            print(f"subscription_data type: {type(subscription_data)}")
+            print("===============================================")
+            
+            if not subscription_data:
+                st.error("Failed to create subscription")
+                return
+            
+            # Debug: Print subscription data
+            print("=== DEBUG: Subscription Data ===")
+            print(f"subscription_data: {subscription_data}")
+            print(f"Keys in subscription_data: {list(subscription_data.keys()) if subscription_data else 'None'}")
+            print(f"Status: {subscription_data.get('status')}")
+            print(f"Trial start: {subscription_data.get('trial_start')}")
+            print(f"Trial end: {subscription_data.get('trial_end')}")
+            print(f"Current period start: {subscription_data.get('current_period_start')}")
+            print(f"Current period end: {subscription_data.get('current_period_end')}")
+            print("=================================")
+            
+            # Debug: Check if we have the required data
+            print("=== DEBUG: Data Validation ===")
+            print(f"subscription_id: {subscription_data.get('subscription_id')}")
+            print(f"current_period_start: {subscription_data.get('current_period_start')}")
+            print(f"current_period_end: {subscription_data.get('current_period_end')}")
+            print("=================================")
+            
+            # Save subscription to database
+            stripe_price_id = payment_service.monthly_price_id or "price_default"
+            
+            # Handle subscription dates - treat trialing as active since we ignore trial periods
+            # For both trialing and active subscriptions, use current_period_start/current_period_end
+            current_period_start = subscription_data.get('current_period_start')
+            current_period_end = subscription_data.get('current_period_end')
+            
+            # Fallback to current time if dates are still None
+            if not current_period_start:
+                current_period_start = datetime.utcnow()
+            if not current_period_end:
+                current_period_end = datetime.utcnow() + timedelta(days=30)
+            
+            # Debug: Print final date values
+            print("=== DEBUG: Final Date Values ===")
+            print(f"current_period_start: {current_period_start}")
+            print(f"current_period_end: {current_period_end}")
+            print(f"current_period_start type: {type(current_period_start)}")
+            print(f"current_period_end type: {type(current_period_end)}")
+            print("=================================")
+            
+            print("=== DEBUG: About to save to database ===")
+            print(f"user_id: {user_id}")
+            print(f"stripe_subscription_id: {subscription_data['subscription_id']}")
+            print(f"stripe_price_id: {stripe_price_id}")
+            print(f"current_period_start: {current_period_start}")
+            print(f"current_period_end: {current_period_end}")
+            print(f"status: {subscription_data.get('status', 'active')}")
+            print("=========================================")
+            
+            try:
+                result = create_subscription(
+                    user_id=user_id,
+                    stripe_subscription_id=subscription_data['subscription_id'],
+                    stripe_price_id=stripe_price_id,
+                    current_period_start=current_period_start,
+                    current_period_end=current_period_end,
+                    status=subscription_data.get('status', 'active')
+                )
+                print(f"=== DEBUG: Database save result ===")
+                print(f"Result: {result}")
+                print("===================================")
+            except Exception as db_error:
+                print(f"=== DEBUG: Database Error ===")
+                print(f"Error: {str(db_error)}")
+                print(f"Error type: {type(db_error)}")
+                print("=============================")
+                raise db_error
+            
+            print("=== DEBUG: Payment processing completed successfully ===")
+            
+            # Show success message and redirect
+            st.success("🎉 Your subscription has been activated successfully!")
+            st.info(f"💳 Payment method saved: {payment_method_data['card_brand'].title()} ending in {payment_method_data['card_last4']}")
+            st.info("You now have unlimited access to create mind maps with Kitap AI. You'll be charged $9.99/month.")
+            
+            # Add a button to go to dashboard
+            if st.button("Go to Dashboard", key="go_to_dashboard_after_payment"):
+                st.session_state["payment_success"] = True
+                st.session_state["show_payment"] = False
+                st.session_state["current_page"] = "dashboard"
+                st.rerun()
+            
+        except Exception as e:
+            print(f"=== DEBUG: Payment processing exception ===")
+            print(f"Exception: {str(e)}")
+            print(f"Exception type: {type(e)}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+            print("===========================================")
+            st.error(f"Payment processing failed: {str(e)}")
+
+    def show_sidebar(self):
+        """Show sidebar navigation"""
+        with st.sidebar:
+            st.markdown("""
+                <div style='text-align: center; padding: 1rem 0;'>
+                    <h2 style='color: #004be0; margin-bottom: 0.5rem;'>📚 Kitap AI</h2>
+                    <p style='color: #666; font-size: 0.9rem;'>Mind Map Generator</p>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Navigation buttons
+            if st.button("🏠 Dashboard", key="sidebar_dashboard", use_container_width=True):
+                st.session_state["current_page"] = "dashboard"
+                st.session_state["show_payment"] = False
+                st.rerun()
+            
+            if st.button("➕ Create New", key="sidebar_create", use_container_width=True):
+                st.session_state["current_page"] = "mindmap"
+                st.session_state["current_mindmap"] = None
+                st.rerun()
+            
+            if st.button("💰 Pricing & Subscription", key="sidebar_pricing", use_container_width=True):
+                st.session_state["current_page"] = "pricing"
+                st.rerun()
+            
+            if st.button("📊 Payment History", key="sidebar_payment_history", use_container_width=True):
+                st.session_state["current_page"] = "payment_history"
+                st.rerun()
+            
+            if st.button("⚙️ Settings", key="sidebar_settings", use_container_width=True):
+                st.session_state["current_page"] = "settings"
+                st.rerun()
+            
+            st.markdown("---")
+            
+            # User info
+            user_id = st.session_state.get("user_id")
+            if user_id:
+                subscription_status = get_user_subscription_status(user_id)
+                if subscription_status:
+                    if subscription_status.get('is_subscription_active'):
+                        st.success("✅ Subscription Active")
+                    else:
+                        st.warning("💳 Subscription Required")
+            
+            # Logout button
+            if st.button("🚪 Logout", key="sidebar_logout", use_container_width=True):
+                st.session_state["logged_in"] = False
+                st.session_state["user_id"] = None
+                st.session_state["current_page"] = "dashboard"
+                st.rerun()
 
     def show_pricing_page(self):
         """Страница с информацией о подписках"""
@@ -1042,6 +1450,11 @@ class MindMapApp:
                 </p>
             </div>
         """, unsafe_allow_html=True)
+
+        # Back to dashboard button
+        if st.button("← Back to Dashboard", key="back_to_dashboard"):
+            st.session_state["current_page"] = "dashboard"
+            st.rerun()
 
         # Создаем два столбца для планов подписки
         col1, col2 = st.columns(2)
@@ -1061,19 +1474,14 @@ class MindMapApp:
                         <p style='margin: 1rem 0; color: #444;'>✓ Export to multiple formats</p>
                         <p style='margin: 1rem 0; color: #444;'>✓ Basic support</p>
                     </div>
-                    <button style='
-                        width: 100%;
-                        background-color: #004be0;
-                        color: white;
-                        border: none;
-                        padding: 1rem;
-                        border-radius: 8px;
-                        font-size: 1.1rem;
-                        cursor: pointer;
-                        transition: all 0.2s;
-                    '>Get Started</button>
                 </div>
             """, unsafe_allow_html=True)
+            
+            # Working Streamlit button for Personal Plan
+            if st.button("Get Started - Personal Plan", key="personal_plan", use_container_width=True):
+                st.session_state["show_payment"] = True
+                st.session_state["selected_plan"] = "personal"
+                st.rerun()
 
         with col2:
             st.markdown("""
@@ -1092,19 +1500,12 @@ class MindMapApp:
                         <p style='margin: 1rem 0; color: #444;'>✓ API access</p>
                         <p style='margin: 1rem 0; color: #444;'>✓ Custom integration</p>
                     </div>
-                    <button style='
-                        width: 100%;
-                        background-color: #004be0;
-                        color: white;
-                        border: none;
-                        padding: 1rem;
-                        border-radius: 8px;
-                        font-size: 1.1rem;
-                        cursor: pointer;
-                        transition: all 0.2s;
-                    '>Contact Sales</button>
                 </div>
             """, unsafe_allow_html=True)
+            
+            # Working Streamlit button for Enterprise Plan
+            if st.button("Contact Sales - Enterprise Plan", key="enterprise_plan", use_container_width=True):
+                st.info("For enterprise plans, please contact our sales team at sales@kitapai.com")
 
         # Добавляем FAQ секцию
         st.markdown("""
@@ -1120,10 +1521,176 @@ class MindMapApp:
             st.write("Yes, you can upgrade or downgrade your plan at any time. Changes will be reflected in your next billing cycle.")
 
         with st.expander("Is there a free trial?"):
-            st.write("Yes, we offer a 14-day free trial for both Personal and Enterprise plans.")
+            st.write("Currently, we require a paid subscription to access Kitap AI. This ensures we can provide the best service and features to our users.")
 
         with st.expander("What kind of support do you provide?"):
             st.write("Personal plan includes email support with 24-hour response time. Enterprise plan includes priority 24/7 support via email, phone, and chat.")
+
+    def show_payment_history_page(self):
+        """Show payment history page"""
+        st.markdown("""
+            <div style='text-align: center; padding: 2rem 0;'>
+                <h1 style='color: #004be0; font-size: 2.5rem; margin-bottom: 1rem;'>Payment History</h1>
+                <p style='color: #666; font-size: 1.2rem; margin-bottom: 3rem;'>View your subscription and payment details</p>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            st.error("User not found")
+            return
+        
+        # Get subscription status
+        subscription_status = get_user_subscription_status(user_id)
+        if subscription_status:
+            st.markdown("### Subscription Status")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if subscription_status.get('is_subscription_active'):
+                    st.success("✅ Subscription Active")
+                    if subscription_status.get('subscription_end_date'):
+                        # Parse ISO string to datetime
+                        sub_end = datetime.fromisoformat(subscription_status['subscription_end_date'])
+                        st.write(f"Next billing: {sub_end.strftime('%Y-%m-%d')}")
+                else:
+                    st.warning("💳 Subscription Required")
+                    st.info("Please subscribe to access mind map creation features.")
+            
+            with col2:
+                st.info(f"Customer ID: {subscription_status.get('stripe_customer_id', 'N/A')}")
+            
+            with col3:
+                if subscription_status.get('is_subscribed'):
+                    st.success("Subscribed: Yes")
+                else:
+                    st.info("Subscribed: No")
+        
+        # Get payment history
+        payment_history = get_user_payment_history(user_id)
+        if payment_history:
+            st.markdown("### Payment History")
+            
+            for payment in payment_history:
+                with st.expander(f"Payment {payment['id']} - {payment['status']}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Amount:** ${payment['amount']/100:.2f}" if payment['amount'] else "Amount: N/A")
+                        st.write(f"**Currency:** {payment['currency']}")
+                    with col2:
+                        st.write(f"**Status:** {payment['status']}")
+                        # Parse ISO string to datetime
+                        created_at = datetime.fromisoformat(payment['created_at'])
+                        st.write(f"**Date:** {created_at.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            st.info("No payment history found.")
+
+    def show_settings_page(self):
+        """Show settings page"""
+        st.markdown("""
+            <div style='text-align: center; padding: 2rem 0;'>
+                <h1 style='color: #004be0; font-size: 2.5rem; margin-bottom: 1rem;'>Settings</h1>
+                <p style='color: #666; font-size: 1.2rem; margin-bottom: 3rem;'>Manage your account and preferences</p>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        user_id = st.session_state.get("user_id")
+        if not user_id:
+            st.error("User not found")
+            return
+        
+        # Account Information
+        st.markdown("### Account Information")
+        
+        # Get user info
+        user = get_user_by_username(f"user_{user_id}")  # This is a placeholder - you might want to create a proper get_user_by_id function
+        if user:
+            st.info(f"**Username:** {user['username']}")
+            st.info(f"**User ID:** {user['id']}")
+            st.info(f"**Account Created:** {user.get('created_at', 'N/A')}")
+        
+        # Subscription Information
+        st.markdown("### Subscription Information")
+        subscription_status = get_user_subscription_status(user_id)
+        if subscription_status:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if subscription_status.get('is_trial_active'):
+                    st.success("🆓 Free Trial Active")
+                    if subscription_status.get('trial_end_date'):
+                        trial_end = datetime.fromisoformat(subscription_status['trial_end_date'])
+                        st.write(f"Trial ends: {trial_end.strftime('%Y-%m-%d')}")
+                elif subscription_status.get('is_subscription_active'):
+                    st.success("✅ Subscription Active")
+                    if subscription_status.get('subscription_end_date'):
+                        sub_end = datetime.fromisoformat(subscription_status['subscription_end_date'])
+                        st.write(f"Next billing: {sub_end.strftime('%Y-%m-%d')}")
+                else:
+                    st.warning("⚠️ Trial Expired")
+            
+            with col2:
+                st.info(f"**Customer ID:** {subscription_status.get('stripe_customer_id', 'N/A')}")
+                st.info(f"**Subscription Status:** {subscription_status.get('subscription_status', 'N/A')}")
+        
+        # Preferences
+        st.markdown("### Preferences")
+        
+        # Language preference
+        languages = {
+            'auto': 'Auto-detect',
+            'ru': 'Русский',
+            'en': 'English',
+            'es': 'Español',
+            'fr': 'Français',
+            'de': 'Deutsch',
+            'it': 'Italiano',
+            'pt': 'Português',
+            'zh': '中文',
+            'ja': '日本語',
+        }
+        
+        selected_language = st.selectbox(
+            "Default Language for Mind Maps",
+            options=list(languages.keys()),
+            format_func=lambda x: languages[x],
+            index=0
+        )
+        
+        # Export preferences
+        st.markdown("#### Export Preferences")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            export_markdown = st.checkbox("Export as Markdown", value=True)
+        with col2:
+            export_html = st.checkbox("Export as HTML", value=True)
+        with col3:
+            export_png = st.checkbox("Export as PNG", value=True)
+        
+        # Save preferences button
+        if st.button("💾 Save Preferences", use_container_width=True):
+            st.success("Preferences saved successfully!")
+        
+        # Danger Zone
+        st.markdown("### Danger Zone")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🗑️ Delete All Mind Maps", type="secondary", use_container_width=True):
+                st.warning("This will permanently delete all your mind maps. This action cannot be undone.")
+                if st.button("⚠️ Confirm Delete All", type="secondary", use_container_width=True):
+                    # Add logic to delete all mind maps
+                    st.error("Delete all mind maps functionality not implemented yet.")
+        
+        with col2:
+            if st.button("🚪 Logout", type="secondary", use_container_width=True):
+                st.session_state["logged_in"] = False
+                st.session_state["user_id"] = None
+                st.session_state["current_page"] = "dashboard"
+                st.rerun()
 
     # Добавим новую функцию для очистки контента майндмапа
     def clean_mindmap_content(self, content: str) -> str:

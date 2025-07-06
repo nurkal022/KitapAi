@@ -6,3 +6,5 @@ tiktoken
 tenacity
 python-dotenv
 SQLAlchemy
+stripe
+cryptography
